@@ -1,155 +1,279 @@
 package CuoiKi;
 
-import java.sql.*;
-import org.json.*;
+import org.json.JSONArray;
+import org.json.JSONObject;
 import org.jsoup.Jsoup;
-import org.jsoup.nodes.Document;
+import org.openqa.selenium.By;
+import org.openqa.selenium.WebDriver;
+import org.openqa.selenium.WebElement;
+
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.util.Random;
 
 public class CrawlerService {
 
-    // Giả lập trình duyệt để tránh bị Codeforces chặn (Tránh lỗi 403 Forbidden)
-    private static final String USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
-    /**
-     * Duyệt qua danh sách người dùng trong Database và bắt đầu crawl.
-     */
+    private static final String USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0 Safari/537.36";
+    private static final String CF_API_URL = "https://codeforces.com/api/user.status?handle=%s&from=1&count=10";
+    private static final String CF_SUBMISSION_URL = "https://codeforces.com/contest/%d/submission/%d";
+    private static final int MAX_SUBMISSIONS_PER_USER = 5;
+    private static final int MIN_CODE_LENGTH = 50;
+    private static final int GYM_CONTEST_THRESHOLD = 100000;
+    private static final int LOGIN_WAIT_TIME = 40000;
+    
+    public static void startAutomation() {
+        WebDriver driver = SeleniumManager.getDriver();      
+        waitForManualAction(driver);       
+        crawlAllUsers();        
+    }
+    
+    private static void waitForManualAction(WebDriver driver) {
+
+        try {
+            driver.get("https://codeforces.com/");
+            Thread.sleep(3000);
+            String pageSource =driver.getPageSource().toLowerCase();
+            boolean loggedIn = pageSource.contains("logout")
+                    || pageSource.contains("/profile/")
+                    || pageSource.contains("enter")
+                            == false;
+
+            if (loggedIn) {
+
+                return;
+            }
+
+            System.out.println( "\nCHƯA ĐĂNG NHẬP CODEFORCES");
+            System.out.println( "Vui lòng đăng nhập..." );
+            
+            Thread.sleep(LOGIN_WAIT_TIME);
+            driver.navigate().refresh();
+            Thread.sleep(3000);
+
+            pageSource = driver.getPageSource().toLowerCase();
+            loggedIn = pageSource.contains("logout")|| pageSource.contains("/profile/");
+            
+            if (loggedIn) {
+                System.out.println( "\nĐĂNG NHẬP THÀNH CÔNG" );
+                System.out.println( "BẮT ĐẦU CRAWL CODE..." );
+
+            } else {
+                System.out.println( "\nKHÔNG PHÁT HIỆN ĐĂNG NHẬP");
+            }
+
+        } catch (Exception e) {
+            logError("waitForManualAction",e );
+        }
+    }
+
     public static void crawlAllUsers() {
-        try (Connection c = Database.getConn()) {
-            Statement st = c.createStatement();
-            ResultSet rs = st.executeQuery("SELECT * FROM users");
+        System.out.println("\n--- BẮT ĐẦU  CRAWL TỰ ĐỘNG ---");
+        try (Connection c = Database.getConn();
+             PreparedStatement ps = c.prepareStatement("SELECT id, username FROM users");
+             ResultSet rs = ps.executeQuery()) {
 
             while (rs.next()) {
                 int userId = rs.getInt("id");
                 String username = rs.getString("username");
 
-                System.out.println("\n===== BẮT ĐẦU CRAWL USER: " + username + " =====");
-                crawlCodeforces(userId, username);
+                printSectionHeader("USER: " + username.toUpperCase());
+                processUserSubmissions(userId, username);
 
-                // Nghỉ 5 giây giữa các user để bảo vệ địa chỉ IP
-                Thread.sleep(5000); 
+                Thread.sleep(5000);
             }
         } catch (Exception e) {
-            System.err.println("Lỗi hệ thống crawl: " + e.getMessage());
+            logError("crawlAllUsers", e);
         }
     }
 
-    /**
-     * Lấy danh sách submission của một user từ API Codeforces.
-     */
-    public static void crawlCodeforces(int userId, String username) {
-        try {
-            // Chỉ lấy 10 submissions gần nhất để tối ưu hiệu năng
-            String apiUrl = "https://codeforces.com/api/user.status?handle=" + username + "&from=1&count=10";
+    public static void analyzeAllSubmissions() {
+        printSectionHeader("BẮT ĐẦU PHÂN TÍCH AI");
+        String query ="SELECT id, code FROM submissions WHERE algorithm IS NULL";
 
+        try (
+                Connection c = Database.getConn();
+                PreparedStatement ps = c.prepareStatement(query);
+                ResultSet rs = ps.executeQuery()
+        ) {
+
+            while (rs.next()) {
+                int id = rs.getInt("id");
+                String code = rs.getString("code");
+                System.out.println( "\nĐANG PHÂN TÍCH SUBMISSION ID: " + id );
+                JSONObject aiResult = null;
+
+                for (int retry = 1; retry <= 3; retry++) {
+                    aiResult = AIAnalyzer.analyzeCode(code);
+                    if (aiResult != null) {
+                        break;
+                    }
+
+                    System.out.println( "AI Retry " + retry + " thất bại -> chờ 15 giây...");
+                    Thread.sleep(10000);
+                }
+
+                if (aiResult != null) {
+                    updateAnalysisInDb( id, aiResult);
+                    System.out.println( "PHÂN TÍCH HOÀN TẤT!" );
+
+                } else {
+                    System.out.println("BỎ QUA SUBMISSION ID: " + id
+                    );
+                }
+
+                int delay = 4000 + new Random().nextInt(10000);
+                System.out.println(  "Chờ " + (delay / 1000)  + " giây...");
+
+                Thread.sleep(delay);
+            }
+
+        } catch (Exception e) {
+            logError("analyzeAllSubmissions", e
+            );
+        }
+    }
+
+
+    private static void processUserSubmissions(int userId, String username) {
+        try {
+            String apiUrl = String.format(CF_API_URL, username);
             String jsonContent = Jsoup.connect(apiUrl)
                     .ignoreContentType(true)
                     .userAgent(USER_AGENT)
-                    .execute()
-                    .body();
+                    .timeout(10000)
+                    .execute().body();
 
             JSONObject json = new JSONObject(jsonContent);
-
-            if (!json.getString("status").equals("OK")) {
-                System.out.println("⚠️ Lỗi API Codeforces với user: " + username);
-                return;
-            }
+            if (!"OK".equals(json.optString("status"))) return;
 
             JSONArray results = json.getJSONArray("result");
-            int count = 0;
+            int savedCount = 0;
 
-            for (int i = 0; i < results.length() && count < 5; i++) { // Giới hạn 5 bài tập phân tích AI mỗi lần
+            for (int i = 0; i < results.length() && savedCount < MAX_SUBMISSIONS_PER_USER; i++) {
                 JSONObject sub = results.getJSONObject(i);
+                
+                if (shouldSkipSubmission(sub)) continue;
 
-                // Chỉ xử lý các bài đã Accepted (OK)
-                if (!sub.has("verdict") || !sub.getString("verdict").equals("OK")) {
-                    continue;
-                }
-
+                long subId = sub.getLong("id");
                 int contestId = sub.getInt("contestId");
-                int submissionId = sub.getInt("id");
-                String problem = sub.getJSONObject("problem").optString("name", "Unknown");
+                String pName = sub.getJSONObject("problem").optString("name", "Unknown");
                 String lang = sub.optString("programmingLanguage", "Unknown");
 
-                System.out.print("→ Đang xử lý bài: " + problem);
+                System.out.printf("Processing: %s (ID: %d)", pName, subId);
 
-                // 1. Lấy mã nguồn (Source Code) từ trang HTML
-                String code = crawlSourceCode(contestId, submissionId);
-
-                if (!code.isEmpty() && !code.equals("code unavailable")) {
-                    System.out.print(" | Đã lấy code | Đang gọi AI...");
-
-                    // 2. Gọi AI để phân tích mã nguồn
-                    JSONObject aiResult = AIAnalyzer.analyzeCode(code);
-
-                    // 3. Lưu tất cả vào Database bao gồm kết quả AI
-                    saveSubmission(userId, problem, lang, code, aiResult);
-
-                    System.out.println(" [HOÀN TẤT]");
-                    count++;
-                    
-                    // 4. Nghỉ 4 giây để tránh lỗi Rate Limit (429) của Groq AI
-                    Thread.sleep(4000); 
+                String code = tryCrawlSourceCode(contestId, subId);
+                if (code != null && !code.isBlank()) {
+                    saveToDatabase(userId, subId, contestId, pName, lang, code);
+                    System.out.println(" -> [ĐÃ LƯU SOURCE CODE]");
+                    savedCount++;
+                    randomDelay();
                 } else {
-                    System.out.println(" | [❌ Không lấy được code]");
+                    System.out.println(" -> [THẤT BẠI: Không lấy được code]");
                 }
             }
         } catch (Exception e) {
-            System.err.println("\nLỗi crawl user " + username + ": " + e.getMessage());
+            logError("processUserSubmissions (" + username + ")", e);
         }
     }
 
-    /**
-     * Truy cập trang web Codeforces để bóc tách mã nguồn bài tập.
-     */
-    public static String crawlSourceCode(int contestId, int submissionId) {
-        try {
-            String url = "https://codeforces.com/contest/" + contestId + "/submission/" + submissionId;
+    private static boolean shouldSkipSubmission(JSONObject sub) {
+        if (!"OK".equals(sub.optString("verdict"))) return true;
+        if (sub.getInt("contestId") > GYM_CONTEST_THRESHOLD) return true;
+        if (Database.submissionExists(sub.getLong("id"))) return true;
+        return false;
+    }
 
-            Document doc = Jsoup.connect(url)
-                    .userAgent(USER_AGENT)
-                    .header("Accept-Language", "vi-VN,vi;q=0.9,en-US;q=0.8")
-                    .referrer("https://codeforces.com/")
-                    .timeout(10000)
-                    .get();
+    private static String tryCrawlSourceCode(int contestId, long subId) throws InterruptedException {
 
-            if (doc.getElementById("program-source-text") != null) {
-                return doc.getElementById("program-source-text").text();
+        String url = String.format(CF_SUBMISSION_URL, contestId,subId);
+        for (int retry = 1; retry <= 3; retry++) {
+            try {
+                WebDriver driver = SeleniumManager.getDriver();
+                driver.get(url);
+                Thread.sleep(4000);
+                if (driver.getTitle() .contains("Verification")) {
+                    System.out.println("\nCAPTCHA DETECTED" );
+
+                    Thread.sleep(15000);
+                    driver.navigate().refresh();
+                    Thread.sleep(5000);
+                }
+
+                if (driver.getPageSource() .contains("program-source-text")) {
+                    WebElement element =driver.findElement( By.id("program-source-text") );
+                    String code =element.getAttribute( "textContent" );
+
+                    if (code != null && code.length() >= MIN_CODE_LENGTH) {
+                        return code;
+                    }
+                }
+
+            } catch (Exception e) {
+                System.out.println("\nSELENIUM ERROR -> RESET DRIVER" );
+                SeleniumManager.resetDriver();
             }
-        } catch (Exception e) {
-            // Không in log để giữ Console sạch sẽ
+            System.out.print(" (Retry " + retry + "...) "
+            );
+            Thread.sleep(5000);
         }
-        return "";
+
+        return null;
     }
 
-    /**
-     * Lưu thông tin bài tập và kết quả phân tích AI vào cơ sở dữ liệu.
-     */
-    public static void saveSubmission(int userId, String problem, String lang, String code, JSONObject aiAnalysis) {
-        String sql = "INSERT INTO submissions(user_id, problem_name, language, code, algorithm, data_structure, ai_generated) VALUES (?,?,?,?,?,?,?)";
-        
+    private static void saveToDatabase(int uId, long sId, int cId, String pName, String lang, String code) {
+        String sql = "INSERT INTO submissions(user_id, submission_id, contest_id, problem_name, language, code) VALUES (?,?,?,?,?,?)";
         try (Connection c = Database.getConn(); 
              PreparedStatement ps = c.prepareStatement(sql)) {
-
-            ps.setInt(1, userId);
-            ps.setString(2, problem);
-            ps.setString(3, lang);
-            ps.setString(4, code);
-
-            // Lưu kết quả từ AI nếu có
-            if (aiAnalysis != null) {
-                ps.setString(5, aiAnalysis.optString("algorithm", "Chưa xác định"));
-                ps.setString(6, aiAnalysis.optString("data_structure", "Chưa xác định"));
-                ps.setString(7, aiAnalysis.optString("ai_generated", "No"));
-            } else {
-                ps.setNull(5, Types.VARCHAR);
-                ps.setNull(6, Types.VARCHAR);
-                ps.setNull(7, Types.VARCHAR);
-            }
-
+            ps.setInt(1, uId);
+            ps.setLong(2, sId);
+            ps.setInt(3, cId);
+            ps.setString(4, pName);
+            ps.setString(5, lang);
+            ps.setString(6, code);
             ps.executeUpdate();
-
         } catch (Exception e) {
-            System.err.println("Lỗi lưu DB: " + e.getMessage());
+            logError("saveToDatabase", e);
         }
+    }
+
+    private static String formatAiField(Object field) {
+        if (field instanceof JSONArray) {
+            JSONArray arr = (JSONArray) field;
+            return String.join(", ", arr.toList().stream().map(Object::toString).toList());
+        }
+        return field != null ? field.toString() : "Unknown";
+    }
+
+    private static void updateAnalysisInDb(int dbId, JSONObject ai) {
+        String sql = "UPDATE submissions SET algorithm=?, data_structure=?, time_complexity=?, ai_generated=?, ai_probability=? WHERE id=?";
+        try (Connection c = Database.getConn(); 
+             PreparedStatement ps = c.prepareStatement(sql)) {
+            
+            ps.setString(1, formatAiField(ai.opt("algorithm")));
+            ps.setString(2, formatAiField(ai.opt("data_structure")));          
+            ps.setString(3, ai.optString("time_complexity", "Unknown"));
+            ps.setString(4, ai.optString("ai_generated", "false"));
+            ps.setInt(5, ai.optInt("ai_probability", 0));
+            ps.setInt(6, dbId);
+            ps.executeUpdate();
+        } catch (Exception e) {
+            logError("updateAnalysisInDb", e);
+        }
+    }
+
+    private static void printSectionHeader(String title) {
+        System.out.println("\n" + "=".repeat(40));
+        System.out.println(" " + title);
+        System.out.println("=".repeat(40));
+    }
+
+    private static void logError(String method, Exception e) {
+        System.err.println("!!! ERROR in " + method + ": " + e.getMessage());
+    }
+
+    private static void randomDelay() throws InterruptedException {
+        Thread.sleep(3000 + new Random().nextInt(4000));
     }
 }
